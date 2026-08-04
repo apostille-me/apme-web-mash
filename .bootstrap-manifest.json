@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "bootstrap_id": "four-org-rust-fleets-2026-08-04-v1",
+  "generated_on": "2026-08-04",
+  "organization": "apostille-me",
+  "repository": "apme-web-mash",
+  "product": "Apostille Me",
+  "kind": "service",
+  "description": "Maud + Axum + SeaORM + Supabase/PostgreSQL + HTMX + WebSocket web server for Apostille Me.",
+  "default_branch": "main",
+  "visibility": "public",
+  "license": "MIT",
+  "dependency_pins": {
+    "flags-2-env": "b596f2d1c99bd726b262a923916e3015bc80bc37",
+    "opto-sync/syncer.rs": "132a97c77867128656070be85d3046b0cc065cbf"
+  }
+}
