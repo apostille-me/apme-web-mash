@@ -18,6 +18,8 @@ exclude = [".env", ".env.*", "node_modules/**", "zed_modules/**", "target/**", "
 [dependencies]
 "apostille-me/apme-interfaces" = "^0.1.0"
 "apostille-me/apme-libs" = "^0.1.0"
+"apostille-me/apme-sync" = "^0.1.0"
+"shared-auth/shared-auth-clients" = "^0.1.0"
 
 [install]
 dir = "zed_modules"
