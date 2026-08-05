@@ -10,11 +10,16 @@ language = "rust"
 vcs = "git"
 url = "https://github.com/apostille-me/apme-web-mash"
 
-[publish]
-include_readme = true
-tag_format = "v{version}"
-exclude = [".env", ".env.*", "node_modules/**", "target/**", "dist/**", "*.log"]
+[install]
+dir = ".vendor/.zed"
 
 [dependencies]
 "apostille-me/apme-interfaces" = "^0.1.0"
 "apostille-me/apme-libs" = "^0.1.0"
+"apostille-me/apme-sync" = "^0.1.0"
+"shared-auth/shared-auth-clients" = "^0.1.0"
+
+[publish]
+include_readme = true
+tag_format = "v{version}"
+exclude = [".env", ".env.*", "node_modules/**", "target/**", "dist/**", "*.log", ".vendor/.zed/**"]
