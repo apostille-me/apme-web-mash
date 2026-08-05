@@ -1,0 +1,20 @@
+[package]
+org = "apostille-me"
+name = "apme-web-mash"
+version = "0.1.0"
+description = "Rust web server for Apostille Me"
+license = "MIT"
+language = "rust"
+
+[package.repository]
+vcs = "git"
+url = "https://github.com/apostille-me/apme-web-mash"
+
+[publish]
+include_readme = true
+tag_format = "v{version}"
+exclude = [".env", ".env.*", "node_modules/**", "target/**", "dist/**", "*.log"]
+
+[dependencies]
+"apostille-me/apme-interfaces" = "^0.1.0"
+"apostille-me/apme-libs" = "^0.1.0"
