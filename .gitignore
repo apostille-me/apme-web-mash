@@ -6,3 +6,7 @@
 *.log
 .idea/
 .vscode/
+tmp
+temp
+tmp/worktrees
+temp/worktrees
