@@ -21,3 +21,42 @@ browser refreshes fragments after WebSocket notifications.
 
 `DATABASE_URL` and `SUPABASE_URL` are optional for the in-memory bootstrap. Never
 expose a Supabase service-role key to browser code.
+
+## Cross-surface delivery
+
+User-visible, case, document, appointment, deadline, jurisdiction, evidence,
+notification, permission, navigation, or deep-link changes in this Rust web
+server must be evaluated for:
+
+- `apostille-me/apostille-flutter` on Android, iOS, Flutter Web/mobile web, and
+  Flutter desktop;
+- `apostille-me/apostille-desktop.rs`, the planned native Rust document-helper
+  application; and
+- Apostille Me interfaces, generated clients, case/document/evidence schemas,
+  route types, redacted fixtures, and conformance tests.
+
+This is judgment-based coordination. Public information, SEO, and web-only case
+administration may remain web-specific. Native scanning, watched folders,
+local PDF/image normalization, redaction, checksums, evidence packaging, secure
+storage, and offline preparation may be native-specific. Case/document state,
+appointments, deadlines, permissions, errors, notifications, and navigation
+normally require coordinated updates or an explicit no-change rationale and
+parity follow-up.
+
+Deep links are HTTPS-first:
+
+```text
+https://<verified-apostille-me-owned-host>/open/<route>?<bounded-query>
+```
+
+A custom-scheme fallback requires a reviewed ADR before registration; do not
+invent one. Web, Flutter, and Rust desktop must share versioned route types and
+fixtures and support cold start, already-running delivery, authentication
+resume, replay/expiry rejection, and browser fallback. Identity-document data,
+case files, document images/PDFs, absolute local paths, credentials, access
+codes, legal notes, and bearer/refresh tokens are prohibited in URLs. Case,
+document, appointment, and evidence handoffs use bounded identifiers or
+short-lived, single-use, audience-bound codes and explicit confirmation.
+
+See [`docs/CROSS_SURFACE_DELIVERY.md`](docs/CROSS_SURFACE_DELIVERY.md) and the
+[portfolio policy](https://github.com/ORESoftware/project-registry/blob/main/docs/cross-surface-delivery.md).
