@@ -8,18 +8,34 @@ description = "Maud + Axum + SeaORM + Supabase/PostgreSQL + HTMX + WebSocket web
 repository = "https://github.com/apostille-me/apme-web-mash"
 publish = false
 
+[features]
+default = ["tcp-transport", "nats-transport"]
+tcp-transport = ["dep:bytes", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:tokio-util"]
+nats-transport = ["dep:async-nats", "dep:bytes"]
+
 [dependencies]
-axum = { version = "0.8", features = ["form", "ws"] }
+anyhow = "1"
+async-nats = { version = "0.45", optional = true }
+axum = { version = "0.8", features = ["form", "json", "ws"] }
+bytes = { version = "1", optional = true }
 futures-util = "0.3"
 maud = { version = "0.27", features = ["axum"] }
-sea-orm = { version = "2.0", features = ["runtime-tokio-rustls", "sqlx-postgres"] }
+next-loggers = { package = "oresoftware-next-loggers", git = "https://github.com/ores-otel/ores.otel.log.git", rev = "ca176fb6768a9750d262a536952268625ffd3a8a" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls-pemfile = { version = "2", optional = true }
+sea-orm = { version = "2.0", default-features = false, features = ["runtime-tokio-rustls", "sqlx-postgres", "with-uuid"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
-tower-http = { version = "0.7", features = ["trace"] }
+shared-auth-client = { git = "https://github.com/shared-auth/shared-auth-clients.git", rev = "cc57a85b276bee81ad94decc87df2f48d49cab9f" }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", optional = true }
+tokio-util = { version = "0.7", features = ["codec"], optional = true }
+tower-http = { version = "0.7", features = ["sensitive-headers", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
 
 [profile.release]
 lto = "thin"
