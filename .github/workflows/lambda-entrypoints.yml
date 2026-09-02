@@ -1,0 +1,54 @@
+name: Isolated Rust Lambda entrypoints
+
+on:
+  pull_request:
+    paths:
+      - "src/lambdas/**"
+      - ".github/workflows/lambda-entrypoints.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lambda-entrypoints-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update
+      - name: Unit-test Lambda event contracts
+        run: cargo +1.88.0 test --manifest-path src/lambdas/Cargo.toml --all-targets
+      - name: Build every independent Lambda binary
+        run: cargo +1.88.0 build --manifest-path src/lambdas/Cargo.toml --release --bins
+
+  cross-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust target
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup target add --toolchain 1.88.0 "${{ matrix.target }}"
+      - name: Type-check every Lambda for the target architecture
+        run: >-
+          cargo +1.88.0 check
+          --manifest-path src/lambdas/Cargo.toml
+          --target "${{ matrix.target }}"
+          --bins
