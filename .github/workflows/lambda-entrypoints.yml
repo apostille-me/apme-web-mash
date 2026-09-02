@@ -59,12 +59,185 @@ jobs:
           --bins
 
   package:
+    name: Package ${{ matrix.arch }} Lambda ZIPs
     needs: [test, cross-check]
-    uses: scintilla-run/gleam-lambda-runner/.github/workflows/package-rust-lambdas.yml@9ff8af8d691454e2b39928555e57e554384999e6
-    with:
-      manifest-path: src/lambdas/Cargo.toml
-      expected-bins: "heavy_document_render heavy_case_export"
-      artifact-prefix: apme-web-mash-rust-lambda-zips
-      retention-days: 30
-    permissions:
-      contents: read
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            runner_machine: x86_64
+            cargo_lambda_asset: cargo-lambda-v1.9.2.x86_64-unknown-linux-musl.tar.gz
+            cargo_lambda_sha256: b5c258c424ebaef39541c3641f33c51137ee6c426016f365628fedb2c737271d
+            expected_machine: 62
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            runner_machine: aarch64
+            cargo_lambda_asset: cargo-lambda-v1.9.2.aarch64-unknown-linux-musl.tar.gz
+            cargo_lambda_sha256: c3fd0a352bb439e4e84a09e5361ea333f7cdc58b0894105e93a33c43b867bc2d
+            expected_machine: 183
+    env:
+      CARGO_LAMBDA_VERSION: 1.9.2
+      EXPECTED_LAMBDA_BINS: heavy_document_render heavy_case_export
+      RUSTUP_TOOLCHAIN: 1.88.0
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify native runner architecture
+        shell: bash
+        env:
+          EXPECTED_RUNNER_MACHINE: ${{ matrix.runner_machine }}
+        run: |
+          set -euo pipefail
+          actual="$(uname -m)"
+          if [[ "$actual" != "$EXPECTED_RUNNER_MACHINE" ]]; then
+            echo "runner architecture $actual does not match $EXPECTED_RUNNER_MACHINE" >&2
+            exit 1
+          fi
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+
+      - name: Install verified Cargo Lambda release
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/${{ matrix.cargo_lambda_asset }}"
+          tool_dir="$RUNNER_TEMP/cargo-lambda-${{ matrix.arch }}"
+          curl --proto '=https' --tlsv1.2 --fail --location --retry 5 \
+            --output "$archive" \
+            "https://github.com/cargo-lambda/cargo-lambda/releases/download/v${CARGO_LAMBDA_VERSION}/${{ matrix.cargo_lambda_asset }}"
+          printf '%s  %s\n' '${{ matrix.cargo_lambda_sha256 }}' "$archive" | sha256sum --check -
+          mkdir -p "$tool_dir"
+          tar -xzf "$archive" -C "$tool_dir"
+          executable=$(find "$tool_dir" -type f -name cargo-lambda -perm -u+x -print -quit)
+          test -n "$executable"
+          printf '%s\n' "$(dirname "$executable")" >> "$GITHUB_PATH"
+          "$executable" --version
+
+      - name: Build every route as an upload-ready ZIP
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/lambda-${{ matrix.arch }}"
+          args=(
+            lambda build
+            --manifest-path src/lambdas/Cargo.toml
+            --release
+            --output-format zip
+            --bins
+            --lambda-dir "$output"
+            --compiler cargo
+          )
+          if [[ "${{ matrix.arch }}" == arm64 ]]; then
+            args+=(--arm64)
+          fi
+          cargo +1.88.0 "${args[@]}"
+          printf 'output=%s\n' "$output" >> "$GITHUB_OUTPUT"
+
+      - name: Validate ZIP roots, executable mode, ELF architecture, and checksums
+        shell: bash
+        env:
+          LAMBDA_OUTPUT: ${{ steps.build.outputs.output }}
+          EXPECTED_MACHINE: ${{ matrix.expected_machine }}
+          ARTIFACT_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import struct
+          import zipfile
+
+          root = Path(os.environ["LAMBDA_OUTPUT"])
+          expected = set(os.environ["EXPECTED_LAMBDA_BINS"].split())
+          archives = sorted(root.glob("*/bootstrap.zip"))
+          found = {archive.parent.name for archive in archives}
+          if found != expected:
+              raise SystemExit(
+                  f"packaged functions do not match expected set: found={sorted(found)} "
+                  f"expected={sorted(expected)}"
+              )
+
+          expected_machine = int(os.environ["EXPECTED_MACHINE"])
+          entries = []
+          checksum_lines = []
+          for archive in archives:
+              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+              with zipfile.ZipFile(archive) as bundle:
+                  names = bundle.namelist()
+                  unsafe = [
+                      name for name in names
+                      if PurePosixPath(name).is_absolute()
+                      or ".." in PurePosixPath(name).parts
+                  ]
+                  if unsafe:
+                      raise SystemExit(f"unsafe ZIP members in {archive}: {unsafe}")
+                  if "bootstrap" not in names:
+                      raise SystemExit(f"bootstrap is not at ZIP root in {archive}")
+                  info = bundle.getinfo("bootstrap")
+                  mode = (info.external_attr >> 16) & 0o777
+                  if info.file_size <= 0 or mode & 0o111 == 0:
+                      raise SystemExit(f"invalid bootstrap metadata in {archive}")
+                  with bundle.open("bootstrap") as executable:
+                      header = executable.read(20)
+                  if len(header) < 20 or header[:4] != b"\x7fELF":
+                      raise SystemExit(f"bootstrap is not ELF in {archive}")
+                  if header[4] != 2 or header[5] != 1:
+                      raise SystemExit(f"bootstrap is not 64-bit little-endian ELF in {archive}")
+                  machine = struct.unpack("<H", header[18:20])[0]
+                  if machine != expected_machine:
+                      raise SystemExit(
+                          f"wrong ELF machine in {archive}: {machine} != {expected_machine}"
+                      )
+
+              relative = archive.relative_to(root).as_posix()
+              checksum_lines.append(f"{digest}  {relative}")
+              entries.append({
+                  "function": archive.parent.name,
+                  "file": relative,
+                  "sha256": digest,
+                  "zipBytes": archive.stat().st_size,
+                  "bootstrapBytes": info.file_size,
+                  "bootstrapMode": f"{mode:04o}",
+                  "elfMachine": machine,
+              })
+
+          manifest = {
+              "schemaVersion": "scintilla.run/rust-lambda-artifacts.v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "sourceCommit": os.environ["SOURCE_SHA"],
+              "architecture": os.environ["ARTIFACT_ARCH"],
+              "runtime": "provided.al2023",
+              "cargoLambdaVersion": os.environ["CARGO_LAMBDA_VERSION"],
+              "functions": entries,
+          }
+          (root / "MANIFEST.json").write_text(
+              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          (root / "SHA256SUMS").write_text(
+              "\n".join(checksum_lines) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Publish immutable-per-run Lambda ZIPs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: apme-web-mash-rust-lambda-zips-${{ matrix.arch }}-${{ env.SOURCE_SHA }}
+          path: ${{ steps.build.outputs.output }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
