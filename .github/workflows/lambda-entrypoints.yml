@@ -5,6 +5,11 @@ on:
     paths:
       - "src/lambdas/**"
       - ".github/workflows/lambda-entrypoints.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/lambdas/**"
+      - ".github/workflows/lambda-entrypoints.yml"
   workflow_dispatch:
 
 permissions:
@@ -16,7 +21,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -30,7 +35,7 @@ jobs:
         run: cargo +1.88.0 build --manifest-path src/lambdas/Cargo.toml --release --bins
 
   cross-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -52,3 +57,14 @@ jobs:
           --manifest-path src/lambdas/Cargo.toml
           --target "${{ matrix.target }}"
           --bins
+
+  package:
+    needs: [test, cross-check]
+    uses: scintilla-run/gleam-lambda-runner/.github/workflows/package-rust-lambdas.yml@d09cc8aed781a10d56126640aea32978dfb31a4c
+    with:
+      manifest-path: src/lambdas/Cargo.toml
+      expected-bins: "heavy_document_render heavy_case_export"
+      artifact-prefix: apme-web-mash-rust-lambda-zips
+      retention-days: 30
+    permissions:
+      contents: read
