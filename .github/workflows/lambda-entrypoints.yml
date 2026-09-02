@@ -60,7 +60,7 @@ jobs:
 
   package:
     needs: [test, cross-check]
-    uses: scintilla-run/gleam-lambda-runner/.github/workflows/package-rust-lambdas.yml@7c636a3f5da466816005ae0d53d6634641e820e9
+    uses: scintilla-run/gleam-lambda-runner/.github/workflows/package-rust-lambdas.yml@9ff8af8d691454e2b39928555e57e554384999e6
     with:
       manifest-path: src/lambdas/Cargo.toml
       expected-bins: "heavy_document_render heavy_case_export"
