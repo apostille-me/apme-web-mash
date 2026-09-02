@@ -82,11 +82,7 @@ pub fn dispatch(payload: &Value, request_id: &str, spec: RouteSpec) -> Value {
     }
 
     let body = decode_body(payload.get("body"));
-    if !body
-        .as_object()
-        .and_then(|object| object.get(spec.required_field))
-        .is_some_and(|value| !value.is_null())
-    {
+    if !has_required_value(&body, spec.required_field) {
         return response(
             422,
             json!({
@@ -113,10 +109,22 @@ pub fn dispatch(payload: &Value, request_id: &str, spec: RouteSpec) -> Value {
             "handler":spec.handler,
             "request_id":request_id,
             "route":spec.path,
-            "input":body,
         }),
         None,
     );
+}
+
+fn has_required_value(body: &Value, field: &str) -> bool {
+    return body
+        .as_object()
+        .and_then(|object| object.get(field))
+        .is_some_and(|value| match value {
+            Value::Null => false,
+            Value::String(text) => !text.trim().is_empty(),
+            Value::Array(items) => !items.is_empty(),
+            Value::Object(fields) => !fields.is_empty(),
+            Value::Bool(_) | Value::Number(_) => true,
+        });
 }
 
 fn decode_body(body: Option<&Value>) -> Value {
@@ -172,7 +180,7 @@ mod tests {
     #[test]
     fn accepts_exact_api_gateway_v2_route() {
         let response = dispatch(
-            &payload("POST", SPEC.path, json!({"document_id":"doc-1"})),
+            &payload("POST", SPEC.path, json!({"document_id":"value-1"})),
             "request-1",
             SPEC,
         );
@@ -189,7 +197,7 @@ mod tests {
             &json!({
                 "path":SPEC.path,
                 "httpMethod":"POST",
-                "body":"{\"document_id\":\"doc-1\"}",
+                "body":"{\"document_id\":\"value-1\"}",
             }),
             "request-2",
             SPEC,
@@ -201,7 +209,7 @@ mod tests {
     fn rejects_route_method_and_missing_field() {
         assert_eq!(
             status(&dispatch(
-                &payload("POST", "/wrong", json!({"document_id":"doc-1"})),
+                &payload("POST", "/wrong", json!({"document_id":"value-1"})),
                 "r",
                 SPEC,
             )),
@@ -209,7 +217,7 @@ mod tests {
         );
         assert_eq!(
             status(&dispatch(
-                &payload("GET", SPEC.path, json!({"document_id":"doc-1"})),
+                &payload("GET", SPEC.path, json!({"document_id":"value-1"})),
                 "r",
                 SPEC,
             )),
@@ -219,11 +227,19 @@ mod tests {
             status(&dispatch(&payload("POST", SPEC.path, json!({})), "r", SPEC)),
             422,
         );
+        assert_eq!(
+            status(&dispatch(
+                &payload("POST", SPEC.path, json!({"document_id":"  "})),
+                "r",
+                SPEC,
+            )),
+            422,
+        );
     }
 
     #[test]
     fn rejects_base64_and_oversized_events() {
-        let mut encoded = payload("POST", SPEC.path, json!({"document_id":"doc-1"}));
+        let mut encoded = payload("POST", SPEC.path, json!({"document_id":"value-1"}));
         encoded["isBase64Encoded"] = Value::Bool(true);
         assert_eq!(status(&dispatch(&encoded, "r", SPEC)), 415);
 
@@ -233,7 +249,7 @@ mod tests {
         };
         assert_eq!(
             status(&dispatch(
-                &payload("POST", SPEC.path, json!({"document_id":"doc-1"})),
+                &payload("POST", SPEC.path, json!({"document_id":"value-1"})),
                 "r",
                 tiny,
             )),
