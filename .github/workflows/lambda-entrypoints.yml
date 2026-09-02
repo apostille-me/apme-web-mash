@@ -121,8 +121,9 @@ jobs:
           tar -xzf "$archive" -C "$tool_dir"
           executable=$(find "$tool_dir" -type f -name cargo-lambda -perm -u+x -print -quit)
           test -n "$executable"
-          printf '%s\n' "$(dirname "$executable")" >> "$GITHUB_PATH"
-          "$executable" --version
+          bin_dir=$(dirname "$executable")
+          printf '%s\n' "$bin_dir" >> "$GITHUB_PATH"
+          PATH="$bin_dir:$PATH" cargo lambda --version
 
       - name: Build every route as an upload-ready ZIP
         id: build
