@@ -113,7 +113,7 @@
   "security": {
     "nonRootUidByMode": {
       "portableHttp": 10001,
-      "oracleFn": 10001
+      "oracleFn": 1000
     },
     "readOnlyRootFilesystem": true,
     "writablePaths": [
