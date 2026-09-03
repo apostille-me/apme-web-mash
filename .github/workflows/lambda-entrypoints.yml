@@ -38,15 +38,15 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
-      - name: Resolve one lockfile for every architecture and platform
+      - name: Verify the committed lockfile and dependency graph
         run: |
           set -euo pipefail
-          cargo +"$RUSTUP_TOOLCHAIN" generate-lockfile --manifest-path src/lambdas/Cargo.toml
           cargo +"$RUSTUP_TOOLCHAIN" metadata \
             --manifest-path src/lambdas/Cargo.toml \
             --locked \
             --format-version 1 \
             > src/lambdas/dependency-metadata.json
+          git diff --exit-code -- src/lambdas/Cargo.lock
       - name: Publish dependency snapshot
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
