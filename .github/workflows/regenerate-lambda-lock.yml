@@ -1,0 +1,55 @@
+name: Regenerate portable serverless lockfile
+
+on:
+  pull_request:
+    paths:
+      - "src/lambdas/Cargo.toml"
+      - "src/lambdas/Cargo.lock"
+      - ".github/workflows/regenerate-lambda-lock.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regenerate-lambda-lock-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update
+
+      - name: Regenerate from the crates.io index
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          Path("src/lambdas/Cargo.lock").unlink(missing_ok=True)
+          PY
+          cargo +1.88.0 generate-lockfile --manifest-path src/lambdas/Cargo.toml
+          cargo +1.88.0 metadata \
+            --manifest-path src/lambdas/Cargo.toml \
+            --locked \
+            --format-version 1 \
+            > src/lambdas/dependency-metadata.json
+          test -s src/lambdas/Cargo.lock
+          test -s src/lambdas/dependency-metadata.json
+          sha256sum src/lambdas/Cargo.lock
+
+      - name: Publish regenerated lock evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: regenerated-lambda-lock-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            src/lambdas/Cargo.lock
+            src/lambdas/dependency-metadata.json
+          if-no-files-found: error
+          retention-days: 7
