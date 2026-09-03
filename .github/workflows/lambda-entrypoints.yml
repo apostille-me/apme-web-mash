@@ -1,4 +1,4 @@
-name: Isolated Rust Lambda entrypoints
+name: Portable Rust serverless entrypoints
 
 on:
   pull_request:
@@ -7,9 +7,8 @@ on:
       - ".github/workflows/lambda-entrypoints.yml"
   push:
     branches: [main]
-    paths:
-      - "src/lambdas/**"
-      - ".github/workflows/lambda-entrypoints.yml"
+    tags:
+      - "lambda-v*"
   workflow_dispatch:
 
 permissions:
@@ -19,24 +18,113 @@ concurrency:
   group: lambda-entrypoints-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  RUSTUP_TOOLCHAIN: "1.88.0"
+  CARGO_LAMBDA_VERSION: "1.9.2"
+  EXPECTED_AWS_BINS: "heavy_document_render heavy_case_export"
+  EXPECTED_HTTP_BINS: "heavy_document_render_http heavy_case_export_http"
+  ROUTE_CONTRACTS_JSON: '{"heavy_case_export":{"body":{"case_id":"ci-case-1"},"method":"POST","path":"/api/heavy/case-export","requiredField":"case_id"},"heavy_document_render":{"body":{"document_id":"ci-document-1"},"method":"POST","path":"/api/heavy/document-render","requiredField":"document_id"}}'
+  ARTIFACT_PREFIX: "apme-web-mash"
+  SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 jobs:
-  test:
+  dependency-lock:
+    name: Freeze dependency graph
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update
-      - name: Unit-test Lambda event contracts
-        run: cargo +1.88.0 test --manifest-path src/lambdas/Cargo.toml --all-targets
-      - name: Build every independent Lambda binary
-        run: cargo +1.88.0 build --manifest-path src/lambdas/Cargo.toml --release --bins
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+      - name: Resolve one lockfile for every architecture and platform
+        run: |
+          set -euo pipefail
+          cargo +"$RUSTUP_TOOLCHAIN" generate-lockfile --manifest-path src/lambdas/Cargo.toml
+          cargo +"$RUSTUP_TOOLCHAIN" metadata \
+            --manifest-path src/lambdas/Cargo.toml \
+            --locked \
+            --format-version 1 \
+            > src/lambdas/dependency-metadata.json
+      - name: Publish dependency snapshot
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lambda-dependency-snapshot-${{ env.SOURCE_SHA }}
+          path: |
+            src/lambdas/Cargo.lock
+            src/lambdas/dependency-metadata.json
+          if-no-files-found: error
+          retention-days: 30
+
+  test:
+    name: Provider-neutral and adapter tests
+    needs: dependency-lock
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore frozen dependency graph
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: lambda-dependency-snapshot-${{ env.SOURCE_SHA }}
+          path: src/lambdas
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+      - name: Unit-test AWS, direct HTTP, CloudEvents, and port contracts
+        run: >-
+          cargo +"$RUSTUP_TOOLCHAIN" test
+          --manifest-path src/lambdas/Cargo.toml
+          --locked
+          --all-targets
+      - name: Build every independent entrypoint
+        run: >-
+          cargo +"$RUSTUP_TOOLCHAIN" build
+          --manifest-path src/lambdas/Cargo.toml
+          --locked
+          --release
+          --bins
+      - name: Validate the checked-in platform contract
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          contract = json.loads(
+              Path("src/lambdas/platforms/contract.json").read_text(encoding="utf-8")
+          )
+          expected = {
+              "aws-lambda",
+              "google-cloud-run",
+              "azure-functions",
+              "knative",
+              "openfaas",
+              "ibm-code-engine",
+          }
+          actual = {item["id"] for item in contract["platforms"]}
+          if actual != expected:
+              raise SystemExit(f"platform contract mismatch: {sorted(actual)}")
+          if contract["commonDenominatorArchitecture"] != "x86_64":
+              raise SystemExit("six-platform common denominator must be x86_64")
+          if contract["http"]["portEnvironment"] != [
+              "FUNCTIONS_CUSTOMHANDLER_PORT",
+              "PORT",
+          ]:
+              raise SystemExit("port precedence drifted")
+          if contract["cloudEvents"] != {
+              "specVersion": "1.0",
+              "modes": ["structured", "binary"],
+          }:
+              raise SystemExit("CloudEvents contract drifted")
+          PY
 
   cross-check:
+    name: Type-check ${{ matrix.target }}
+    needs: dependency-lock
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -44,55 +132,70 @@ jobs:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Restore frozen dependency graph
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: lambda-dependency-snapshot-${{ env.SOURCE_SHA }}
+          path: src/lambdas
       - name: Install pinned Rust target
         run: |
-          rustup toolchain install 1.88.0 --profile minimal --no-self-update
-          rustup target add --toolchain 1.88.0 "${{ matrix.target }}"
-      - name: Type-check every Lambda for the target architecture
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+          rustup target add --toolchain "$RUSTUP_TOOLCHAIN" "${{ matrix.target }}"
+      - name: Type-check AWS and portable HTTP binaries
         run: >-
-          cargo +1.88.0 check
+          cargo +"$RUSTUP_TOOLCHAIN" check
           --manifest-path src/lambdas/Cargo.toml
+          --locked
           --target "${{ matrix.target }}"
           --bins
 
   package:
-    name: Package ${{ matrix.arch }} Lambda ZIPs
-    needs: [test, cross-check]
+    name: Package ${{ matrix.arch }} serverless artifacts
+    needs: [dependency-lock, test, cross-check]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
+            image_arch: amd64
             runner: ubuntu-24.04
             runner_machine: x86_64
+            rust_target: x86_64-unknown-linux-musl
             cargo_lambda_asset: cargo-lambda-v1.9.2.x86_64-unknown-linux-musl.tar.gz
             cargo_lambda_sha256: b5c258c424ebaef39541c3641f33c51137ee6c426016f365628fedb2c737271d
             expected_machine: 62
           - arch: arm64
+            image_arch: arm64
             runner: ubuntu-24.04-arm
             runner_machine: aarch64
+            rust_target: aarch64-unknown-linux-musl
             cargo_lambda_asset: cargo-lambda-v1.9.2.aarch64-unknown-linux-musl.tar.gz
             cargo_lambda_sha256: c3fd0a352bb439e4e84a09e5361ea333f7cdc58b0894105e93a33c43b867bc2d
             expected_machine: 183
     env:
-      CARGO_LAMBDA_VERSION: 1.9.2
-      EXPECTED_LAMBDA_BINS: heavy_document_render heavy_case_export
-      RUSTUP_TOOLCHAIN: 1.88.0
-      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      ARTIFACT_ARCH: ${{ matrix.arch }}
+      IMAGE_ARCH: ${{ matrix.image_arch }}
+      RUST_TARGET: ${{ matrix.rust_target }}
+      EXPECTED_MACHINE: ${{ matrix.expected_machine }}
 
     steps:
       - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Restore frozen dependency graph
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: lambda-dependency-snapshot-${{ env.SOURCE_SHA }}
+          path: src/lambdas
+
       - name: Verify native runner architecture
-        shell: bash
         env:
           EXPECTED_RUNNER_MACHINE: ${{ matrix.runner_machine }}
         run: |
@@ -102,13 +205,30 @@ jobs:
             echo "runner architecture $actual does not match $EXPECTED_RUNNER_MACHINE" >&2
             exit 1
           fi
+          docker version
 
-      - name: Install pinned Rust toolchain
-        shell: bash
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+      - name: Install packaging prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            binutils \
+            ca-certificates \
+            curl \
+            file \
+            jq \
+            musl-tools \
+            unzip \
+            zip
+
+      - name: Install pinned Rust toolchain and musl target
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+          rustup target add --toolchain "$RUSTUP_TOOLCHAIN" "$RUST_TARGET"
+          rustc +"$RUSTUP_TOOLCHAIN" --version --verbose
 
       - name: Install verified Cargo Lambda release
-        shell: bash
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/${{ matrix.cargo_lambda_asset }}"
@@ -119,126 +239,530 @@ jobs:
           printf '%s  %s\n' '${{ matrix.cargo_lambda_sha256 }}' "$archive" | sha256sum --check -
           mkdir -p "$tool_dir"
           tar -xzf "$archive" -C "$tool_dir"
-          executable=$(find "$tool_dir" -type f -name cargo-lambda -perm -u+x -print -quit)
+          executable="$(find "$tool_dir" -type f -name cargo-lambda -perm -u+x -print -quit)"
           test -n "$executable"
-          bin_dir=$(dirname "$executable")
+          bin_dir="$(dirname "$executable")"
           printf '%s\n' "$bin_dir" >> "$GITHUB_PATH"
           PATH="$bin_dir:$PATH" cargo lambda --version
 
-      - name: Build every route as an upload-ready ZIP
-        id: build
-        shell: bash
+      - name: Build AWS Lambda Runtime API ZIPs
+        id: aws
         run: |
           set -euo pipefail
-          output="$RUNNER_TEMP/lambda-${{ matrix.arch }}"
-          args=(
-            lambda build
-            --manifest-path src/lambdas/Cargo.toml
-            --release
-            --output-format zip
-            --bins
-            --lambda-dir "$output"
-            --compiler cargo
-          )
-          if [[ "${{ matrix.arch }}" == arm64 ]]; then
-            args+=(--arm64)
+          output="$RUNNER_TEMP/serverless-${ARTIFACT_ARCH}/aws"
+          mkdir -p "$output"
+          extra=()
+          if [[ "$ARTIFACT_ARCH" == arm64 ]]; then
+            extra+=(--arm64)
           fi
-          cargo +1.88.0 "${args[@]}"
+          for binary in $EXPECTED_AWS_BINS; do
+            cargo +"$RUSTUP_TOOLCHAIN" lambda build \
+              --manifest-path src/lambdas/Cargo.toml \
+              --release \
+              --locked \
+              --no-default-features \
+              --features aws \
+              --output-format zip \
+              --bin "$binary" \
+              --lambda-dir "$output" \
+              --compiler cargo \
+              "${extra[@]}"
+          done
           printf 'output=%s\n' "$output" >> "$GITHUB_OUTPUT"
 
-      - name: Validate ZIP roots, executable mode, ELF architecture, and checksums
-        shell: bash
-        env:
-          LAMBDA_OUTPUT: ${{ steps.build.outputs.output }}
-          EXPECTED_MACHINE: ${{ matrix.expected_machine }}
-          ARTIFACT_ARCH: ${{ matrix.arch }}
+      - name: Build static portable HTTP binaries
+        id: portable
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/serverless-${ARTIFACT_ARCH}/portable"
+          mkdir -p "$output"
+          for binary in $EXPECTED_HTTP_BINS; do
+            cargo +"$RUSTUP_TOOLCHAIN" build \
+              --manifest-path src/lambdas/Cargo.toml \
+              --locked \
+              --release \
+              --no-default-features \
+              --features http \
+              --target "$RUST_TARGET" \
+              --bin "$binary"
+            route="${binary%_http}"
+            install -D -m 0555 \
+              "src/lambdas/target/${RUST_TARGET}/release/${binary}" \
+              "$output/${route}/function"
+          done
+          printf 'output=%s\n' "$output" >> "$GITHUB_OUTPUT"
+
+      - name: Validate AWS ZIPs and portable ELF binaries
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib
           import json
           import os
           from pathlib import Path, PurePosixPath
           import struct
           import zipfile
 
-          root = Path(os.environ["LAMBDA_OUTPUT"])
-          expected = set(os.environ["EXPECTED_LAMBDA_BINS"].split())
-          archives = sorted(root.glob("*/bootstrap.zip"))
-          found = {archive.parent.name for archive in archives}
-          if found != expected:
-              raise SystemExit(
-                  f"packaged functions do not match expected set: found={sorted(found)} "
-                  f"expected={sorted(expected)}"
-              )
-
+          aws_root = Path(os.environ["RUNNER_TEMP"]) / f"serverless-{os.environ['ARTIFACT_ARCH']}" / "aws"
+          portable_root = Path(os.environ["RUNNER_TEMP"]) / f"serverless-{os.environ['ARTIFACT_ARCH']}" / "portable"
+          aws_bins = set(os.environ["EXPECTED_AWS_BINS"].split())
+          http_bins = set(os.environ["EXPECTED_HTTP_BINS"].split())
           expected_machine = int(os.environ["EXPECTED_MACHINE"])
-          entries = []
-          checksum_lines = []
+
+          archives = sorted(aws_root.glob("*/bootstrap.zip"))
+          if {archive.parent.name for archive in archives} != aws_bins:
+              raise SystemExit("AWS ZIP set does not match EXPECTED_AWS_BINS")
           for archive in archives:
-              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
               with zipfile.ZipFile(archive) as bundle:
                   names = bundle.namelist()
                   unsafe = [
-                      name for name in names
+                      name
+                      for name in names
                       if PurePosixPath(name).is_absolute()
                       or ".." in PurePosixPath(name).parts
                   ]
-                  if unsafe:
-                      raise SystemExit(f"unsafe ZIP members in {archive}: {unsafe}")
-                  if "bootstrap" not in names:
-                      raise SystemExit(f"bootstrap is not at ZIP root in {archive}")
+                  if unsafe or names != ["bootstrap"]:
+                      raise SystemExit(f"unsafe or non-minimal Lambda ZIP: {archive}: {names}")
                   info = bundle.getinfo("bootstrap")
                   mode = (info.external_attr >> 16) & 0o777
                   if info.file_size <= 0 or mode & 0o111 == 0:
                       raise SystemExit(f"invalid bootstrap metadata in {archive}")
                   with bundle.open("bootstrap") as executable:
-                      header = executable.read(20)
-                  if len(header) < 20 or header[:4] != b"\x7fELF":
-                      raise SystemExit(f"bootstrap is not ELF in {archive}")
-                  if header[4] != 2 or header[5] != 1:
-                      raise SystemExit(f"bootstrap is not 64-bit little-endian ELF in {archive}")
+                      header = executable.read(64)
+                  if header[:4] != b"\x7fELF":
+                      raise SystemExit(f"bootstrap is not ELF: {archive}")
                   machine = struct.unpack("<H", header[18:20])[0]
                   if machine != expected_machine:
-                      raise SystemExit(
-                          f"wrong ELF machine in {archive}: {machine} != {expected_machine}"
-                      )
+                      raise SystemExit(f"wrong AWS ELF machine in {archive}: {machine}")
 
-              relative = archive.relative_to(root).as_posix()
-              checksum_lines.append(f"{digest}  {relative}")
-              entries.append({
-                  "function": archive.parent.name,
-                  "file": relative,
-                  "sha256": digest,
-                  "zipBytes": archive.stat().st_size,
-                  "bootstrapBytes": info.file_size,
-                  "bootstrapMode": f"{mode:04o}",
-                  "elfMachine": machine,
-              })
+          expected_routes = {name.removesuffix("_http") for name in http_bins}
+          binaries = sorted(portable_root.glob("*/function"))
+          if {binary.parent.name for binary in binaries} != expected_routes:
+              raise SystemExit("portable binary set does not match EXPECTED_HTTP_BINS")
+          for binary in binaries:
+              data = binary.read_bytes()
+              if data[:4] != b"\x7fELF":
+                  raise SystemExit(f"portable binary is not ELF: {binary}")
+              machine = struct.unpack("<H", data[18:20])[0]
+              if machine != expected_machine:
+                  raise SystemExit(f"wrong portable ELF machine in {binary}: {machine}")
+              if data[4] != 2 or data[5] != 1:
+                  raise SystemExit(f"portable binary is not 64-bit little-endian ELF: {binary}")
+              phoff = struct.unpack("<Q", data[32:40])[0]
+              phentsize = struct.unpack("<H", data[54:56])[0]
+              phnum = struct.unpack("<H", data[56:58])[0]
+              program_types = {
+                  struct.unpack("<I", data[phoff + index * phentsize: phoff + index * phentsize + 4])[0]
+                  for index in range(phnum)
+              }
+              if 3 in program_types:
+                  raise SystemExit(f"portable binary has a dynamic interpreter: {binary}")
 
-          manifest = {
-              "schemaVersion": "scintilla.run/rust-lambda-artifacts.v1",
-              "repository": os.environ["GITHUB_REPOSITORY"],
-              "sourceCommit": os.environ["SOURCE_SHA"],
+          print(json.dumps({
+              "awsFunctions": sorted(aws_bins),
+              "portableFunctions": sorted(expected_routes),
               "architecture": os.environ["ARTIFACT_ARCH"],
-              "runtime": "provided.al2023",
-              "cargoLambdaVersion": os.environ["CARGO_LAMBDA_VERSION"],
-              "functions": entries,
-          }
-          (root / "MANIFEST.json").write_text(
-              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-          )
-          (root / "SHA256SUMS").write_text(
-              "\n".join(checksum_lines) + "\n", encoding="utf-8"
-          )
-          print(json.dumps(manifest, indent=2))
+              "elfMachine": expected_machine,
+          }, indent=2))
           PY
 
-      - name: Publish immutable-per-run Lambda ZIPs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Build OCI images, exercise HTTP and CloudEvents, and render provider bundles
+        id: bundles
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/serverless-${ARTIFACT_ARCH}"
+          portable="$root/portable"
+          mkdir -p "$root/platforms"
+          echo "$ROUTE_CONTRACTS_JSON" | jq -e . >/dev/null
+
+          cleanup_container() {
+            local container_id="${1:-}"
+            if [[ -n "$container_id" ]]; then
+              docker logs "$container_id" || true
+              docker stop "$container_id" >/dev/null 2>&1 || true
+            fi
+          }
+
+          for route in $(jq -r 'keys[]' <<<"$ROUTE_CONTRACTS_JSON"); do
+            path="$(jq -r --arg route "$route" '.[$route].path' <<<"$ROUTE_CONTRACTS_JSON")"
+            method="$(jq -r --arg route "$route" '.[$route].method' <<<"$ROUTE_CONTRACTS_JSON")"
+            body="$(jq -c --arg route "$route" '.[$route].body' <<<"$ROUTE_CONTRACTS_JSON")"
+            binary="$portable/$route/function"
+            route_root="$root/platforms/$route"
+            context="$route_root/oci-context"
+            mkdir -p "$context/rootfs/tmp" "$route_root/oci"
+            : > "$context/rootfs/tmp/.keep"
+            install -m 0555 "$binary" "$context/function"
+            install -m 0444 /etc/ssl/certs/ca-certificates.crt "$context/ca-certificates.crt"
+            cat > "$context/Dockerfile" <<'DOCKERFILE'
+          FROM scratch
+          ARG SOURCE_SHA
+          ARG ROUTE_NAME
+          LABEL org.opencontainers.image.revision="${SOURCE_SHA}"
+          LABEL io.scintilla.serverless.route="${ROUTE_NAME}"
+          LABEL io.scintilla.serverless.contract="portable-http-v1"
+          COPY --chmod=0555 function /function
+          COPY --chmod=0444 ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+          COPY --chmod=1777 rootfs/tmp /tmp
+          ENV HOME=/tmp \
+              TMPDIR=/tmp \
+              SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+              PORT=8080
+          USER 10001:10001
+          WORKDIR /tmp
+          EXPOSE 8080
+          ENTRYPOINT ["/function"]
+          DOCKERFILE
+
+            image="scintilla-${route}:${ARTIFACT_ARCH}-${GITHUB_RUN_ID}"
+            docker build \
+              --platform "linux/${IMAGE_ARCH}" \
+              --build-arg "SOURCE_SHA=${SOURCE_SHA}" \
+              --build-arg "ROUTE_NAME=${route}" \
+              --tag "$image" \
+              "$context"
+            test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "$IMAGE_ARCH"
+            docker image inspect "$image" > "$route_root/oci/image-inspect.json"
+
+            container_id="$(docker run --detach --rm \
+              --read-only \
+              --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --env PORT=9999 \
+              --env FUNCTIONS_CUSTOMHANDLER_PORT=8080 \
+              --publish 127.0.0.1:18080:8080 \
+              "$image")"
+            trap 'cleanup_container "$container_id"' EXIT
+
+            ready=false
+            for _ in $(seq 1 100); do
+              if curl --fail --silent --show-error \
+                http://127.0.0.1:18080/healthz >/dev/null; then
+                ready=true
+                break
+              fi
+              sleep 0.1
+            done
+            if [[ "$ready" != true ]]; then
+              echo "portable function did not become healthy: $route" >&2
+              exit 1
+            fi
+            curl --fail --silent --show-error \
+              http://127.0.0.1:18080/readyz | jq -e '.ok == true' >/dev/null
+
+            direct_status="$(curl --silent --show-error \
+              --output "$route_root/direct-response.json" \
+              --write-out '%{http_code}' \
+              --request "$method" \
+              --header 'content-type: application/json' \
+              --header 'x-request-id: ci-direct-1' \
+              --data "$body" \
+              "http://127.0.0.1:18080${path}")"
+            test "$direct_status" = 202
+            jq -e --arg route "$route" \
+              '.accepted == true and .handler == $route and .request_id == "ci-direct-1"' \
+              "$route_root/direct-response.json" >/dev/null
+
+            structured="$(jq -nc --argjson data "$body" '{
+              specversion:"1.0",
+              id:"ci-structured-1",
+              source:"urn:scintilla:ci",
+              type:"scintilla.route.request",
+              data:$data
+            }')"
+            structured_status="$(curl --silent --show-error \
+              --output "$route_root/structured-cloudevent-response.json" \
+              --write-out '%{http_code}' \
+              --request "$method" \
+              --header 'content-type: application/cloudevents+json' \
+              --data "$structured" \
+              http://127.0.0.1:18080/)"
+            test "$structured_status" = 202
+            jq -e '.request_id == "ci-structured-1"' \
+              "$route_root/structured-cloudevent-response.json" >/dev/null
+
+            binary_status="$(curl --silent --show-error \
+              --output "$route_root/binary-cloudevent-response.json" \
+              --write-out '%{http_code}' \
+              --request "$method" \
+              --header 'content-type: application/json' \
+              --header 'ce-specversion: 1.0' \
+              --header 'ce-id: ci-binary-1' \
+              --header 'ce-source: urn:scintilla:ci' \
+              --header 'ce-type: scintilla.route.request' \
+              --data "$body" \
+              "http://127.0.0.1:18080${path}")"
+            test "$binary_status" = 202
+            jq -e '.request_id == "ci-binary-1"' \
+              "$route_root/binary-cloudevent-response.json" >/dev/null
+
+            cleanup_container "$container_id"
+            container_id=""
+            trap - EXIT
+
+            docker save "$image" | gzip -9 > \
+              "$route_root/oci/${route}-${ARTIFACT_ARCH}.docker.tar.gz"
+
+            cat > "$route_root/knative-service.yaml" <<YAML
+          apiVersion: serving.knative.dev/v1
+          kind: Service
+          metadata:
+            name: ${route//_/-}
+          spec:
+            template:
+              spec:
+                containers:
+                  - image: IMAGE_DIGEST
+                    ports:
+                      - containerPort: 8080
+                    env:
+                      - name: PORT
+                        value: "8080"
+                    readinessProbe:
+                      httpGet:
+                        path: /readyz
+                        port: 8080
+          YAML
+
+            cat > "$route_root/openfaas-stack.yml" <<YAML
+          version: "1.0"
+          provider:
+            name: openfaas
+          functions:
+            ${route//_/-}:
+              image: IMAGE_DIGEST
+              skip_build: true
+              environment:
+                PORT: "8080"
+              annotations:
+                com.openfaas.scale.min: "0"
+          YAML
+
+            if [[ "$ARTIFACT_ARCH" == x86_64 ]]; then
+              cat > "$route_root/google-cloud-run-service.yaml" <<YAML
+          apiVersion: serving.knative.dev/v1
+          kind: Service
+          metadata:
+            name: ${route//_/-}
+          spec:
+            template:
+              metadata:
+                annotations:
+                  autoscaling.knative.dev/minScale: "0"
+              spec:
+                containerConcurrency: 80
+                timeoutSeconds: 300
+                containers:
+                  - image: IMAGE_DIGEST
+                    ports:
+                      - containerPort: 8080
+                    env:
+                      - name: PORT
+                        value: "8080"
+                    startupProbe:
+                      httpGet:
+                        path: /healthz
+                        port: 8080
+              traffic:
+                - percent: 100
+                  latestRevision: true
+          YAML
+
+              cat > "$route_root/ibm-code-engine.txt" <<EOF
+          ibmcloud ce app create \
+            --name ${route//_/-} \
+            --image IMAGE_DIGEST \
+            --port 8080 \
+            --min-scale 0
+          EOF
+
+              azure="$route_root/azure-functions"
+              mkdir -p "$azure/$route"
+              install -m 0555 "$binary" "$azure/handler"
+              cat > "$azure/host.json" <<'JSON'
+          {
+            "version": "2.0",
+            "customHandler": {
+              "description": {
+                "defaultExecutablePath": "handler"
+              },
+              "enableProxyingHttpRequest": true
+            },
+            "extensionBundle": {
+              "id": "Microsoft.Azure.Functions.ExtensionBundle",
+              "version": "[4.*, 5.0.0)"
+            }
+          }
+          JSON
+              azure_route="${path#/api/}"
+              jq -n \
+                --arg method "${method,,}" \
+                --arg route "$azure_route" \
+                '{
+                  bindings:[
+                    {
+                      authLevel:"function",
+                      type:"httpTrigger",
+                      direction:"in",
+                      name:"req",
+                      methods:[$method],
+                      route:$route
+                    },
+                    {
+                      type:"http",
+                      direction:"out",
+                      name:"res"
+                    }
+                  ]
+                }' > "$azure/$route/function.json"
+              cat > "$azure/local.settings.example.json" <<'JSON'
+          {
+            "IsEncrypted": false,
+            "Values": {
+              "FUNCTIONS_WORKER_RUNTIME": "Custom",
+              "AzureWebJobsStorage": "UseDevelopmentStorage=true"
+            }
+          }
+          JSON
+              (
+                cd "$azure"
+                zip -q -r "../${route}-azure-functions-x86_64.zip" .
+              )
+              unzip -Z1 "$route_root/${route}-azure-functions-x86_64.zip" \
+                | grep -qx 'handler'
+              unzip -Z1 "$route_root/${route}-azure-functions-x86_64.zip" \
+                | grep -qx 'host.json'
+              unzip -Z1 "$route_root/${route}-azure-functions-x86_64.zip" \
+                | grep -qx "${route}/function.json"
+            fi
+          done
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / f"serverless-{os.environ['ARTIFACT_ARCH']}"
+          contracts = json.loads(os.environ["ROUTE_CONTRACTS_JSON"])
+          arch = os.environ["ARTIFACT_ARCH"]
+          common = arch == "x86_64"
+          targets = {
+              "awsLambda": {
+                  "supported": True,
+                  "artifact": "aws/<route>/bootstrap.zip",
+                  "runtime": "provided.al2023",
+                  "adapter": "AWS Runtime API",
+              },
+              "googleCloudRun": {
+                  "supported": common,
+                  "artifact": "platforms/<route>/oci/<route>-x86_64.docker.tar.gz",
+                  "transport": "HTTP and CloudEvents 1.0",
+              },
+              "azureFunctions": {
+                  "supported": common,
+                  "artifact": "platforms/<route>/<route>-azure-functions-x86_64.zip",
+                  "adapter": "custom handler with enableProxyingHttpRequest",
+              },
+              "knative": {
+                  "supported": True,
+                  "artifact": "platforms/<route>/oci/<route>-<arch>.docker.tar.gz",
+                  "transport": "HTTP and CloudEvents 1.0",
+              },
+              "openFaaS": {
+                  "supported": True,
+                  "artifact": "platforms/<route>/oci/<route>-<arch>.docker.tar.gz",
+                  "transport": "HTTP",
+              },
+              "ibmCodeEngine": {
+                  "supported": common,
+                  "artifact": "platforms/<route>/oci/<route>-x86_64.docker.tar.gz",
+                  "mode": "Code Engine application/container",
+              },
+          }
+          document = {
+              "schemaVersion": "scintilla.run/serverless-artifacts.v2",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "sourceCommit": os.environ["SOURCE_SHA"],
+              "architecture": arch,
+              "commonDenominatorArchitecture": "x86_64",
+              "routes": [
+                  {
+                      "name": name,
+                      "httpBinary": f"{name}_http",
+                      **contract,
+                  }
+                  for name, contract in sorted(contracts.items())
+              ],
+              "targets": targets,
+          }
+          (root / "MANIFEST.json").write_text(
+              json.dumps(document, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          cp src/lambdas/Cargo.lock "$root/Cargo.lock"
+          cp src/lambdas/dependency-metadata.json "$root/dependency-metadata.json"
+
+          (
+            cd "$root"
+            find . -type f ! -name SHA256SUMS -print0 \
+              | LC_ALL=C sort -z \
+              | xargs -0 sha256sum > SHA256SUMS
+          )
+          printf 'output=%s\n' "$root" >> "$GITHUB_OUTPUT"
+
+      - name: Publish architecture-specific serverless artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: apme-web-mash-rust-lambda-zips-${{ matrix.arch }}-${{ env.SOURCE_SHA }}
-          path: ${{ steps.build.outputs.output }}
+          name: ${{ env.ARTIFACT_PREFIX }}-serverless-${{ matrix.arch }}-${{ env.SOURCE_SHA }}
+          path: ${{ steps.bundles.outputs.output }}
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
+
+  release:
+    name: Publish tagged serverless release
+    if: startsWith(github.ref, 'refs/tags/lambda-v')
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download both architecture artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: ${{ env.ARTIFACT_PREFIX }}-serverless-*-${{ env.SOURCE_SHA }}
+          path: release-artifacts
+          merge-multiple: false
+      - name: Assemble immutable release archives
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          shopt -s nullglob
+          directories=(release-artifacts/*)
+          (( ${#directories[@]} == 2 )) || {
+            printf 'expected two architecture artifact directories, found %d\n' \
+              "${#directories[@]}" >&2
+            exit 66
+          }
+          for directory in "${directories[@]}"; do
+            name="$(basename "$directory")"
+            tar -C "$directory" -czf "release-assets/${name}.tar.gz" .
+          done
+          (
+            cd release-assets
+            sha256sum -- *.tar.gz > SHA256SUMS
+          )
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            release-assets/*.tar.gz \
+            release-assets/SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"
