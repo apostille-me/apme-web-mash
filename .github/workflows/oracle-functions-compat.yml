@@ -1,0 +1,364 @@
+name: Oracle Functions compatibility
+
+on:
+  pull_request:
+    paths:
+      - "src/lambdas/**"
+      - ".github/workflows/oracle-functions-compat.yml"
+  push:
+    branches: [main]
+    tags:
+      - "lambda-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-functions-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTUP_TOOLCHAIN: "1.88.0"
+  EXPECTED_FN_BINS: "heavy_document_render_fn heavy_case_export_fn"
+  ROUTE_CONTRACTS_JSON: '{"heavy_case_export":{"body":{"case_id":"ci-case-1"},"method":"POST","path":"/api/heavy/case-export"},"heavy_document_render":{"body":{"document_id":"ci-document-1"},"method":"POST","path":"/api/heavy/document-render"}}'
+  ARTIFACT_PREFIX: "apme-web-mash"
+  SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  package-and-smoke-test:
+    name: Oracle Functions ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            image_arch: amd64
+            runner: ubuntu-24.04
+            runner_machine: x86_64
+            rust_target: x86_64-unknown-linux-musl
+            expected_machine: 62
+          - arch: arm64
+            image_arch: arm64
+            runner: ubuntu-24.04-arm
+            runner_machine: aarch64
+            rust_target: aarch64-unknown-linux-musl
+            expected_machine: 183
+    env:
+      ARTIFACT_ARCH: ${{ matrix.arch }}
+      IMAGE_ARCH: ${{ matrix.image_arch }}
+      RUST_TARGET: ${{ matrix.rust_target }}
+      EXPECTED_MACHINE: ${{ matrix.expected_machine }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify native runner architecture
+        run: |
+          set -euo pipefail
+          actual="$(uname -m)"
+          if [[ "$actual" != "${{ matrix.runner_machine }}" ]]; then
+            echo "runner architecture $actual does not match ${{ matrix.runner_machine }}" >&2
+            exit 1
+          fi
+          docker version
+
+      - name: Install pinned toolchain and native musl support
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            binutils \
+            ca-certificates \
+            curl \
+            jq \
+            musl-tools
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+          rustup target add --toolchain "$RUSTUP_TOOLCHAIN" "$RUST_TARGET"
+          rustc +"$RUSTUP_TOOLCHAIN" --version --verbose
+
+      - name: Validate the seven-platform contract
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          contract = json.loads(
+              Path("src/lambdas/platforms/serverless-platforms.v2.json").read_text(encoding="utf-8")
+          )
+          expected = {
+              "aws-lambda",
+              "google-cloud-run",
+              "azure-functions",
+              "knative",
+              "openfaas",
+              "ibm-code-engine",
+              "oracle-functions",
+          }
+          actual = {item["id"] for item in contract["platforms"]}
+          if actual != expected:
+              raise SystemExit(f"platform contract mismatch: {sorted(actual)}")
+          oracle = contract["oracleFn"]
+          if oracle["requiredFormat"] != "http-stream":
+              raise SystemExit("Oracle/Fn format drifted")
+          if oracle["logicalStatusHeader"] != "Fn-Http-Status":
+              raise SystemExit("Oracle/Fn logical status header drifted")
+          PY
+
+      - name: Unit-test the Fn http-stream adapter
+        run: |
+          set -euo pipefail
+          for binary in $EXPECTED_FN_BINS; do
+            cargo +"$RUSTUP_TOOLCHAIN" test \
+              --manifest-path src/lambdas/Cargo.toml \
+              --locked \
+              --no-default-features \
+              --features http \
+              --bin "$binary"
+          done
+
+      - name: Build static Fn entrypoints
+        id: build
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/oracle-functions-${ARTIFACT_ARCH}"
+          mkdir -p "$output/functions"
+          for binary in $EXPECTED_FN_BINS; do
+            cargo +"$RUSTUP_TOOLCHAIN" build \
+              --manifest-path src/lambdas/Cargo.toml \
+              --locked \
+              --release \
+              --no-default-features \
+              --features http \
+              --target "$RUST_TARGET" \
+              --bin "$binary"
+            route="${binary%_fn}"
+            install -D -m 0555 \
+              "src/lambdas/target/${RUST_TARGET}/release/${binary}" \
+              "$output/functions/${route}/function"
+          done
+          printf 'output=%s\n' "$output" >> "$GITHUB_OUTPUT"
+
+      - name: Validate ELF architecture and static linkage
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import struct
+
+          root = Path(os.environ["RUNNER_TEMP"]) / f"oracle-functions-{os.environ['ARTIFACT_ARCH']}" / "functions"
+          expected_machine = int(os.environ["EXPECTED_MACHINE"])
+          expected_routes = {name.removesuffix("_fn") for name in os.environ["EXPECTED_FN_BINS"].split()}
+          binaries = sorted(root.glob("*/function"))
+          found = {binary.parent.name for binary in binaries}
+          if found != expected_routes:
+              raise SystemExit(f"Fn binary set mismatch: found={sorted(found)} expected={sorted(expected_routes)}")
+
+          for binary in binaries:
+              data = binary.read_bytes()
+              if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+                  raise SystemExit(f"not a 64-bit little-endian ELF: {binary}")
+              machine = struct.unpack("<H", data[18:20])[0]
+              if machine != expected_machine:
+                  raise SystemExit(f"wrong ELF machine in {binary}: {machine} != {expected_machine}")
+              phoff = struct.unpack("<Q", data[32:40])[0]
+              phentsize = struct.unpack("<H", data[54:56])[0]
+              phnum = struct.unpack("<H", data[56:58])[0]
+              program_types = {
+                  struct.unpack("<I", data[phoff + index * phentsize: phoff + index * phentsize + 4])[0]
+                  for index in range(phnum)
+              }
+              if 3 in program_types:
+                  raise SystemExit(f"Fn executable has a dynamic interpreter: {binary}")
+          PY
+
+      - name: Exercise the Fn Project Unix-socket HTTP stream
+        run: |
+          set -euo pipefail
+          root="${{ steps.build.outputs.output }}"
+          jq -e . <<<"$ROUTE_CONTRACTS_JSON" >/dev/null
+          for route in $(jq -r 'keys[]' <<<"$ROUTE_CONTRACTS_JSON"); do
+            binary="$root/functions/$route/function"
+            socket="$RUNNER_TEMP/${route}-${ARTIFACT_ARCH}.sock"
+            headers="$RUNNER_TEMP/${route}-${ARTIFACT_ARCH}.headers"
+            response="$RUNNER_TEMP/${route}-${ARTIFACT_ARCH}.json"
+            log="$RUNNER_TEMP/${route}-${ARTIFACT_ARCH}.log"
+            path="$(jq -r --arg route "$route" '.[$route].path' <<<"$ROUTE_CONTRACTS_JSON")"
+            method="$(jq -r --arg route "$route" '.[$route].method' <<<"$ROUTE_CONTRACTS_JSON")"
+            body="$(jq -c --arg route "$route" '.[$route].body' <<<"$ROUTE_CONTRACTS_JSON")"
+
+            FN_FORMAT=http-stream \
+              FN_LISTENER="unix://${socket}" \
+              "$binary" >"$log" 2>&1 &
+            pid=$!
+            cleanup() {
+              kill "$pid" >/dev/null 2>&1 || true
+              wait "$pid" >/dev/null 2>&1 || true
+              find "$socket" -maxdepth 0 -type l -delete 2>/dev/null || true
+              find "$(dirname "$socket")/phony$(basename "$socket")" \
+                -maxdepth 0 -type s -delete 2>/dev/null || true
+            }
+            trap cleanup EXIT
+
+            for _ in $(seq 1 200); do
+              [[ -S "$socket" ]] && break
+              sleep 0.05
+            done
+            [[ -S "$socket" ]] || {
+              cat "$log" >&2
+              exit 70
+            }
+
+            curl --silent --show-error \
+              --unix-socket "$socket" \
+              --dump-header "$headers" \
+              --output "$response" \
+              --request POST \
+              --header "Fn-Intent: httprequest" \
+              --header "Fn-Call-Id: ci-${route}-${ARTIFACT_ARCH}" \
+              --header "Fn-Http-Method: ${method}" \
+              --header "Fn-Http-Request-Url: https://functions.example${path}" \
+              --header "Content-Type: application/json" \
+              --data "$body" \
+              http://localhost/call
+
+            grep -Eq '^HTTP/1\.[01] 200 ' "$headers"
+            grep -Eiq '^fn-http-status:[[:space:]]*202\r?$' "$headers"
+            jq -e --arg route "$route" \
+              '.accepted == true and .handler == $route' \
+              "$response" >/dev/null
+
+            cloud_event="$(jq -cn \
+              --arg id "ce-${route}-${ARTIFACT_ARCH}" \
+              --argjson data "$body" \
+              '{specversion:"1.0",id:$id,source:"urn:scintilla:ci",type:"scintilla.route.requested",data:$data}')"
+            curl --silent --show-error \
+              --unix-socket "$socket" \
+              --dump-header "$headers" \
+              --output "$response" \
+              --request POST \
+              --header "Fn-Intent: httprequest" \
+              --header "Fn-Call-Id: ce-${route}-${ARTIFACT_ARCH}" \
+              --header "Fn-Http-Method: ${method}" \
+              --header "Fn-Http-Request-Url: https://functions.example${path}" \
+              --header "Content-Type: application/cloudevents+json" \
+              --data "$cloud_event" \
+              http://localhost/call
+            grep -Eiq '^fn-http-status:[[:space:]]*202\r?$' "$headers"
+            jq -e --arg route "$route" \
+              '.accepted == true and .handler == $route' \
+              "$response" >/dev/null
+
+            binary_event_id="ce-binary-${route}-${ARTIFACT_ARCH}"
+            curl --silent --show-error \
+              --unix-socket "$socket" \
+              --dump-header "$headers" \
+              --output "$response" \
+              --request POST \
+              --header "Fn-Intent: httprequest" \
+              --header "Fn-Http-Method: ${method}" \
+              --header "Fn-Http-Request-Url: https://functions.example${path}" \
+              --header "Content-Type: application/json" \
+              --header "Fn-Http-H-Ce-Specversion: 1.0" \
+              --header "Fn-Http-H-Ce-Id: ${binary_event_id}" \
+              --header "Fn-Http-H-Ce-Source: urn:scintilla:ci" \
+              --header "Fn-Http-H-Ce-Type: scintilla.route.requested" \
+              --data "$body" \
+              http://localhost/call
+            grep -Eiq '^fn-http-status:[[:space:]]*202\r?$' "$headers"
+            grep -Eiq "^x-request-id:[[:space:]]*${binary_event_id}\r?$" "$headers"
+            jq -e --arg route "$route" \
+              '.accepted == true and .handler == $route' \
+              "$response" >/dev/null
+
+            cleanup
+            trap - EXIT
+          done
+
+      - name: Render Oracle Functions/Fn Project bundles
+        id: bundle
+        run: |
+          set -euo pipefail
+          root="${{ steps.build.outputs.output }}"
+          mkdir -p "$root/bundles"
+          for route in $(jq -r 'keys[]' <<<"$ROUTE_CONTRACTS_JSON"); do
+            path="$(jq -r --arg route "$route" '.[$route].path' <<<"$ROUTE_CONTRACTS_JSON")"
+            bundle="$root/bundles/$route"
+            mkdir -p "$bundle"
+            install -m 0555 "$root/functions/$route/function" "$bundle/function"
+            cat > "$bundle/Dockerfile" <<'DOCKERFILE'
+          FROM alpine:3.22 AS identity
+          RUN addgroup -S -g 1000 fn \
+            && adduser -S -D -H -u 1000 -G fn fn
+
+          FROM scratch
+          COPY --from=identity /etc/passwd /etc/passwd
+          COPY --from=identity /etc/group /etc/group
+          COPY --chmod=0555 function /function
+          ENV FN_FORMAT=http-stream
+          USER fn:fn
+          ENTRYPOINT ["/function"]
+          DOCKERFILE
+            cat > "$bundle/func.yaml" <<YAML
+          schema_version: 20180708
+          name: ${route}
+          version: 0.1.0
+          runtime: docker
+          entrypoint: /function
+          memory: 256
+          timeout: 120
+          triggers:
+            - name: ${route}-http
+              type: http
+              source: ${path}
+          YAML
+            image="oracle-${route}:${ARTIFACT_ARCH}-${GITHUB_RUN_ID}"
+            docker build \
+              --platform "linux/${IMAGE_ARCH}" \
+              --tag "$image" \
+              "$bundle"
+            test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "$IMAGE_ARCH"
+            test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$image")" = '["/function"]'
+            docker image inspect "$image" > "$bundle/image-inspect.json"
+            docker save "$image" | gzip -n > "$bundle/${route}-oracle-functions-${ARTIFACT_ARCH}.docker.tar.gz"
+            sha256sum "$bundle/function" "$bundle"/*.docker.tar.gz > "$bundle/SHA256SUMS"
+          done
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / f"oracle-functions-{os.environ['ARTIFACT_ARCH']}"
+          routes = sorted(path.name for path in (root / "bundles").iterdir() if path.is_dir())
+          manifest = {
+              "schemaVersion": "scintilla.run/oracle-functions-artifacts.v1",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "sourceCommit": os.environ["SOURCE_SHA"],
+              "architecture": os.environ["ARTIFACT_ARCH"],
+              "ociArchitecture": os.environ["IMAGE_ARCH"],
+              "fnFormat": "http-stream",
+              "listener": "unix://<platform-provided-socket>",
+              "runtime": "docker",
+              "routes": routes,
+          }
+          (root / "MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(manifest, indent=2))
+          PY
+          printf 'output=%s\n' "$root" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Oracle Functions compatibility evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}-oracle-functions-${{ matrix.arch }}-${{ env.SOURCE_SHA }}
+          path: ${{ steps.bundle.outputs.output }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
