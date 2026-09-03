@@ -21,7 +21,6 @@ concurrency:
 env:
   RUSTUP_TOOLCHAIN: "1.88.0"
   EXPECTED_FN_BINS: "heavy_document_render_fn heavy_case_export_fn"
-  ROUTE_CONTRACTS_JSON: '{"heavy_case_export":{"body":{"case_id":"ci-case-1"},"method":"POST","path":"/api/heavy/case-export"},"heavy_document_render":{"body":{"document_id":"ci-document-1"},"method":"POST","path":"/api/heavy/document-render"}}'
   ARTIFACT_PREFIX: "apme-web-mash"
   SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -75,7 +74,6 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             binutils \
             ca-certificates \
-            curl \
             jq \
             musl-tools
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
@@ -109,19 +107,20 @@ jobs:
               raise SystemExit("Oracle/Fn format drifted")
           if oracle["logicalStatusHeader"] != "Fn-Http-Status":
               raise SystemExit("Oracle/Fn logical status header drifted")
+          if contract["security"]["nonRootUidByMode"]["oracleFn"] != 1000:
+              raise SystemExit("Oracle/Fn UID must remain 1000")
           PY
 
-      - name: Unit-test the Fn http-stream adapter
+      - name: Exercise real Fn binaries over the Unix-socket protocol
         run: |
           set -euo pipefail
-          for binary in $EXPECTED_FN_BINS; do
-            cargo +"$RUSTUP_TOOLCHAIN" test \
-              --manifest-path src/lambdas/Cargo.toml \
-              --locked \
-              --no-default-features \
-              --features http \
-              --bin "$binary"
-          done
+          cargo +"$RUSTUP_TOOLCHAIN" test \
+            --manifest-path src/lambdas/Cargo.toml \
+            --locked \
+            --no-default-features \
+            --features http \
+            --test oracle_fn_process \
+            -- --nocapture
 
       - name: Build static Fn entrypoints
         id: build
@@ -179,117 +178,14 @@ jobs:
                   raise SystemExit(f"Fn executable has a dynamic interpreter: {binary}")
           PY
 
-      - name: Exercise the Fn Project Unix-socket HTTP stream
-        run: |
-          set -euo pipefail
-          root="${{ steps.build.outputs.output }}"
-          jq -e . <<<"$ROUTE_CONTRACTS_JSON" >/dev/null
-          for route in $(jq -r 'keys[]' <<<"$ROUTE_CONTRACTS_JSON"); do
-            binary="$root/functions/$route/function"
-            socket="$RUNNER_TEMP/${route}-${ARTIFACT_ARCH}.sock"
-            headers="$RUNNER_TEMP/${route}-${ARTIFACT_ARCH}.headers"
-            response="$RUNNER_TEMP/${route}-${ARTIFACT_ARCH}.json"
-            log="$RUNNER_TEMP/${route}-${ARTIFACT_ARCH}.log"
-            path="$(jq -r --arg route "$route" '.[$route].path' <<<"$ROUTE_CONTRACTS_JSON")"
-            method="$(jq -r --arg route "$route" '.[$route].method' <<<"$ROUTE_CONTRACTS_JSON")"
-            body="$(jq -c --arg route "$route" '.[$route].body' <<<"$ROUTE_CONTRACTS_JSON")"
-
-            FN_FORMAT=http-stream \
-              FN_LISTENER="unix://${socket}" \
-              "$binary" >"$log" 2>&1 &
-            pid=$!
-            cleanup() {
-              kill "$pid" >/dev/null 2>&1 || true
-              wait "$pid" >/dev/null 2>&1 || true
-              find "$socket" -maxdepth 0 -type l -delete 2>/dev/null || true
-              find "$(dirname "$socket")/phony$(basename "$socket")" \
-                -maxdepth 0 -type s -delete 2>/dev/null || true
-            }
-            trap cleanup EXIT
-
-            for _ in $(seq 1 200); do
-              [[ -S "$socket" ]] && break
-              sleep 0.05
-            done
-            [[ -S "$socket" ]] || {
-              cat "$log" >&2
-              exit 70
-            }
-
-            curl --silent --show-error \
-              --unix-socket "$socket" \
-              --dump-header "$headers" \
-              --output "$response" \
-              --request POST \
-              --header "Fn-Intent: httprequest" \
-              --header "Fn-Call-Id: ci-${route}-${ARTIFACT_ARCH}" \
-              --header "Fn-Http-Method: ${method}" \
-              --header "Fn-Http-Request-Url: https://functions.example${path}" \
-              --header "Content-Type: application/json" \
-              --data "$body" \
-              http://localhost/call
-
-            grep -Eq '^HTTP/1\.[01] 200 ' "$headers"
-            grep -Eiq '^fn-http-status:[[:space:]]*202\r?$' "$headers"
-            jq -e --arg route "$route" \
-              '.accepted == true and .handler == $route' \
-              "$response" >/dev/null
-
-            cloud_event="$(jq -cn \
-              --arg id "ce-${route}-${ARTIFACT_ARCH}" \
-              --argjson data "$body" \
-              '{specversion:"1.0",id:$id,source:"urn:scintilla:ci",type:"scintilla.route.requested",data:$data}')"
-            curl --silent --show-error \
-              --unix-socket "$socket" \
-              --dump-header "$headers" \
-              --output "$response" \
-              --request POST \
-              --header "Fn-Intent: httprequest" \
-              --header "Fn-Call-Id: ce-${route}-${ARTIFACT_ARCH}" \
-              --header "Fn-Http-Method: ${method}" \
-              --header "Fn-Http-Request-Url: https://functions.example${path}" \
-              --header "Content-Type: application/cloudevents+json" \
-              --data "$cloud_event" \
-              http://localhost/call
-            grep -Eiq '^fn-http-status:[[:space:]]*202\r?$' "$headers"
-            jq -e --arg route "$route" \
-              '.accepted == true and .handler == $route' \
-              "$response" >/dev/null
-
-            binary_event_id="ce-binary-${route}-${ARTIFACT_ARCH}"
-            curl --silent --show-error \
-              --unix-socket "$socket" \
-              --dump-header "$headers" \
-              --output "$response" \
-              --request POST \
-              --header "Fn-Intent: httprequest" \
-              --header "Fn-Http-Method: ${method}" \
-              --header "Fn-Http-Request-Url: https://functions.example${path}" \
-              --header "Content-Type: application/json" \
-              --header "Fn-Http-H-Ce-Specversion: 1.0" \
-              --header "Fn-Http-H-Ce-Id: ${binary_event_id}" \
-              --header "Fn-Http-H-Ce-Source: urn:scintilla:ci" \
-              --header "Fn-Http-H-Ce-Type: scintilla.route.requested" \
-              --data "$body" \
-              http://localhost/call
-            grep -Eiq '^fn-http-status:[[:space:]]*202\r?$' "$headers"
-            grep -Eiq "^x-request-id:[[:space:]]*${binary_event_id}\r?$" "$headers"
-            jq -e --arg route "$route" \
-              '.accepted == true and .handler == $route' \
-              "$response" >/dev/null
-
-            cleanup
-            trap - EXIT
-          done
-
       - name: Render Oracle Functions/Fn Project bundles
         id: bundle
         run: |
           set -euo pipefail
           root="${{ steps.build.outputs.output }}"
           mkdir -p "$root/bundles"
-          for route in $(jq -r 'keys[]' <<<"$ROUTE_CONTRACTS_JSON"); do
-            path="$(jq -r --arg route "$route" '.[$route].path' <<<"$ROUTE_CONTRACTS_JSON")"
+          for binary in $EXPECTED_FN_BINS; do
+            route="${binary%_fn}"
             bundle="$root/bundles/$route"
             mkdir -p "$bundle"
             install -m 0555 "$root/functions/$route/function" "$bundle/function"
@@ -314,11 +210,15 @@ jobs:
           entrypoint: /function
           memory: 256
           timeout: 120
-          triggers:
-            - name: ${route}-http
-              type: http
-              source: ${path}
           YAML
+            cat > "$bundle/DEPLOYMENT.md" <<MARKDOWN
+          # ${route} on Oracle Functions
+
+          This bundle uses the Fn Project \\`http-stream\` contract. OCI Functions supplies
+          \\`FN_LISTENER\` at invocation time and starts the container as UID/GID 1000.
+          Publish one architecture-specific image, or combine the verified amd64 and arm64
+          images into a multi-architecture manifest before choosing Generic_X86_ARM.
+          MARKDOWN
             image="oracle-${route}:${ARTIFACT_ARCH}-${GITHUB_RUN_ID}"
             docker build \
               --platform "linux/${IMAGE_ARCH}" \
@@ -326,6 +226,7 @@ jobs:
               "$bundle"
             test "$(docker image inspect --format '{{.Architecture}}' "$image")" = "$IMAGE_ARCH"
             test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$image")" = '["/function"]'
+            test "$(docker image inspect --format '{{.Config.User}}' "$image")" = 'fn:fn'
             docker image inspect "$image" > "$bundle/image-inspect.json"
             docker save "$image" | gzip -n > "$bundle/${route}-oracle-functions-${ARTIFACT_ARCH}.docker.tar.gz"
             sha256sum "$bundle/function" "$bundle"/*.docker.tar.gz > "$bundle/SHA256SUMS"
@@ -347,6 +248,8 @@ jobs:
               "fnFormat": "http-stream",
               "listener": "unix://<platform-provided-socket>",
               "runtime": "docker",
+              "containerUser": "fn:fn",
+              "containerUidGid": "1000:1000",
               "routes": routes,
           }
           (root / "MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
