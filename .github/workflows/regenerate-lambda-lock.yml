@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: regenerate-lambda-lock-${{ github.ref }}
@@ -19,10 +19,14 @@ jobs:
   regenerate:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      TARGET_BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
+          ref: ${{ env.TARGET_BRANCH }}
+          persist-credentials: true
+          fetch-depth: 1
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --no-self-update
@@ -43,6 +47,19 @@ jobs:
           test -s src/lambdas/Cargo.lock
           test -s src/lambdas/dependency-metadata.json
           sha256sum src/lambdas/Cargo.lock
+
+      - name: Commit the exact regenerated lockfile
+        run: |
+          set -euo pipefail
+          git add -- src/lambdas/Cargo.lock
+          if git diff --cached --quiet; then
+            echo "Cargo.lock is already current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "build: regenerate portable serverless lockfile"
+          git push origin "HEAD:${TARGET_BRANCH}"
 
       - name: Publish regenerated lock evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
