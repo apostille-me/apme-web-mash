@@ -17,7 +17,15 @@ dir = ".vendor/.zed"
 "apostille-me/apme-interfaces" = "^0.1.0"
 "apostille-me/apme-libs" = "^0.1.0"
 "apostille-me/apme-sync" = "^0.1.0"
-"shared-auth/shared-auth-clients" = "^0.1.0"
+"oresoftware/next-loggers" = "=0.1.0"
+"shared-auth/shared-auth-clients" = "=0.1.0"
+
+[targets.rust]
+dir = "."
+adapter = "none"
+
+[scripts]
+test = "cargo fmt --all -- --check && cargo test --all-targets --all-features --locked && cargo clippy --all-targets --all-features --locked -- -D warnings"
 
 [publish]
 include_readme = true
