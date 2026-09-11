@@ -1,0 +1,98 @@
+{
+  "schemaVersion": "scintilla.run/serverless-platforms.v1",
+  "commonDenominatorArchitecture": "x86_64",
+  "artifactModes": {
+    "aws": "runtime-api-zip",
+    "portable": "stateless-http-oci",
+    "azure": "custom-handler-zip"
+  },
+  "http": {
+    "bindAddress": "0.0.0.0",
+    "defaultPort": 8080,
+    "portEnvironment": [
+      "FUNCTIONS_CUSTOMHANDLER_PORT",
+      "PORT"
+    ],
+    "healthPaths": [
+      "/healthz",
+      "/readyz"
+    ],
+    "maxRequestBytes": 1048576,
+    "rootDispatch": "map / to the route for event-delivery integrations"
+  },
+  "cloudEvents": {
+    "specVersion": "1.0",
+    "modes": [
+      "structured",
+      "binary"
+    ]
+  },
+  "platforms": [
+    {
+      "id": "aws-lambda",
+      "mode": "AWS Runtime API custom-runtime ZIP",
+      "architectures": [
+        "x86_64",
+        "arm64"
+      ],
+      "artifact": "aws/<route>/bootstrap.zip",
+      "notes": "Select one architecture per function; runtime provided.al2023."
+    },
+    {
+      "id": "google-cloud-run",
+      "mode": "portable HTTP OCI container",
+      "architectures": [
+        "x86_64"
+      ],
+      "artifact": "platforms/<route>/oci/<route>-x86_64.docker.tar.gz",
+      "notes": "Cloud Run runtime architecture is x86_64; listen on PORT."
+    },
+    {
+      "id": "azure-functions",
+      "mode": "custom handler ZIP with HTTP proxying",
+      "architectures": [
+        "x86_64"
+      ],
+      "artifact": "platforms/<route>/<route>-azure-functions-x86_64.zip",
+      "notes": "Use enableProxyingHttpRequest and FUNCTIONS_CUSTOMHANDLER_PORT."
+    },
+    {
+      "id": "knative",
+      "mode": "portable HTTP/CloudEvents OCI container",
+      "architectures": [
+        "x86_64",
+        "arm64"
+      ],
+      "artifact": "platforms/<route>/oci/<route>-<arch>.docker.tar.gz",
+      "requiresMatchingNodeArchitecture": true
+    },
+    {
+      "id": "openfaas",
+      "mode": "portable HTTP OCI container",
+      "architectures": [
+        "x86_64",
+        "arm64"
+      ],
+      "artifact": "platforms/<route>/oci/<route>-<arch>.docker.tar.gz",
+      "requiresMatchingNodeArchitecture": true
+    },
+    {
+      "id": "ibm-code-engine",
+      "mode": "Code Engine application/container",
+      "architectures": [
+        "x86_64"
+      ],
+      "artifact": "platforms/<route>/oci/<route>-x86_64.docker.tar.gz",
+      "notes": "Deploy as a Code Engine application; listen on PORT."
+    }
+  ],
+  "security": {
+    "nonRootUid": 10001,
+    "readOnlyRootFilesystem": true,
+    "writablePaths": [
+      "/tmp"
+    ],
+    "shellFreeEntrypoint": true,
+    "secretsInArtifacts": false
+  }
+}
