@@ -1,0 +1,126 @@
+{
+  "schemaVersion": "scintilla.run/serverless-platforms.v2",
+  "commonDenominatorArchitecture": "x86_64",
+  "artifactModes": {
+    "aws": "runtime-api-zip",
+    "portable": "stateless-http-oci",
+    "azure": "custom-handler-zip",
+    "oracle": "fn-http-stream-oci"
+  },
+  "http": {
+    "bindAddress": "0.0.0.0",
+    "defaultPort": 8080,
+    "portEnvironment": [
+      "FUNCTIONS_CUSTOMHANDLER_PORT",
+      "PORT"
+    ],
+    "healthPaths": [
+      "/healthz",
+      "/readyz"
+    ],
+    "maxRequestBytes": 1048576,
+    "rootDispatch": "map / to the route for event-delivery integrations"
+  },
+  "oracleFn": {
+    "formatEnvironment": "FN_FORMAT",
+    "requiredFormat": "http-stream",
+    "listenerEnvironment": "FN_LISTENER",
+    "transport": "HTTP/1.1 over an absolute Unix-domain socket",
+    "logicalStatusHeader": "Fn-Http-Status",
+    "outerSuccessStatus": 200,
+    "requestHeaders": {
+      "method": "Fn-Http-Method",
+      "url": "Fn-Http-Request-Url",
+      "requestId": "Fn-Call-Id"
+    }
+  },
+  "cloudEvents": {
+    "specVersion": "1.0",
+    "modes": [
+      "structured",
+      "binary"
+    ]
+  },
+  "platforms": [
+    {
+      "id": "aws-lambda",
+      "mode": "AWS Runtime API custom-runtime ZIP",
+      "architectures": [
+        "x86_64",
+        "arm64"
+      ],
+      "artifact": "aws/<route>/bootstrap.zip",
+      "notes": "Select one architecture per function; runtime provided.al2023."
+    },
+    {
+      "id": "google-cloud-run",
+      "mode": "portable HTTP OCI container",
+      "architectures": [
+        "x86_64"
+      ],
+      "artifact": "platforms/<route>/oci/<route>-x86_64.docker.tar.gz",
+      "notes": "Cloud Run bring-your-own binaries are Linux x86_64 and must listen on PORT."
+    },
+    {
+      "id": "azure-functions",
+      "mode": "custom handler ZIP with HTTP proxying",
+      "architectures": [
+        "x86_64"
+      ],
+      "artifact": "platforms/<route>/<route>-azure-functions-x86_64.zip",
+      "notes": "Use enableProxyingHttpRequest and FUNCTIONS_CUSTOMHANDLER_PORT."
+    },
+    {
+      "id": "knative",
+      "mode": "portable HTTP/CloudEvents OCI container",
+      "architectures": [
+        "x86_64",
+        "arm64"
+      ],
+      "artifact": "platforms/<route>/oci/<route>-<arch>.docker.tar.gz",
+      "requiresMatchingNodeArchitecture": true
+    },
+    {
+      "id": "openfaas",
+      "mode": "portable HTTP OCI container",
+      "architectures": [
+        "x86_64",
+        "arm64"
+      ],
+      "artifact": "platforms/<route>/oci/<route>-<arch>.docker.tar.gz",
+      "requiresMatchingNodeArchitecture": true
+    },
+    {
+      "id": "ibm-code-engine",
+      "mode": "Code Engine application/container",
+      "architectures": [
+        "x86_64"
+      ],
+      "artifact": "platforms/<route>/oci/<route>-x86_64.docker.tar.gz",
+      "notes": "Deploy as a Code Engine application; listen on PORT."
+    },
+    {
+      "id": "oracle-functions",
+      "mode": "Fn Project HTTP-stream OCI function",
+      "architectures": [
+        "x86_64",
+        "arm64"
+      ],
+      "artifact": "bundles/<route>/<route>-oracle-functions-<arch>.docker.tar.gz",
+      "notes": "Choose Generic_X86, Generic_ARM, or publish a multi-architecture manifest for Generic_X86_ARM."
+    }
+  ],
+  "security": {
+    "nonRootUidByMode": {
+      "portableHttp": 10001,
+      "oracleFn": 1000
+    },
+    "readOnlyRootFilesystem": true,
+    "writablePaths": [
+      "/tmp",
+      "runtime-provided FN_LISTENER socket directory"
+    ],
+    "shellFreeEntrypoint": true,
+    "secretsInArtifacts": false
+  }
+}
