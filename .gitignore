@@ -41,3 +41,6 @@ env/dec/
 *.age-key
 keys.txt
 sops-private*.txt
+
+# Machine-local agent instruction symlink (absolute path; never committed)
+.ores/
