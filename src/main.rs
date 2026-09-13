@@ -56,13 +56,14 @@ struct NewItem {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    const ROUTINE_ID: &str = "ores-routine-yD12QJQcfvVEon7VjWpt_";
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,tower_http=info".into()),
         )
         .init();
-    let _ores_logger = init_ores_logger()?;
+    let ores_logger = init_ores_logger()?;
     let auth = SharedAuthVerifier::from_env()?;
     let database = match env::var("DATABASE_URL") {
         Ok(url) if !url.trim().is_empty() => Some(Database::connect(url).await?),
@@ -114,11 +115,19 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "Apostille Me MASH web listening");
-    axum::serve(listener, app).await?;
+    if let Err(error) = axum::serve(listener, app).await {
+        let _ = ores_logger
+            .error(vec![serde_json::json!("service.serve.failed")])
+            .add_trace("ores-trace-QhgEv26r6_BFZP0ueikBP", false)
+            .add_routine_id(ROUTINE_ID)
+            .send();
+        return Err(error.into());
+    }
     Ok(())
 }
 
 fn init_ores_logger() -> anyhow::Result<Logger> {
+    const ROUTINE_ID: &str = "ores-routine-jqrtfbNVVRrBRDP6nxCSQ";
     let logger = Logger::new(Options {
         app_name: "apme-web-mash".to_owned(),
         console: true,
@@ -141,6 +150,8 @@ fn init_ores_logger() -> anyhow::Result<Logger> {
                 ]),
             ),
         ]))
+        .add_trace("ores-trace-KiMOTzRq6Mo9LkD_Na7Yi", false)
+        .add_routine_id(ROUTINE_ID)
         .send()?;
     Ok(logger)
 }
